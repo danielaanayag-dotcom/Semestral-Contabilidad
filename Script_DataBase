@@ -1,0 +1,293 @@
+-- Payroll schema + seed + calculation for XAMPP (MySQL / MariaDB)
+-- Company: LA PROSPERA, S.A. — Quincena: Segunda quincena de junio 2026
+-- Assumptions (explicit):
+-- * Currency: B/. (treated 1:1 with $)
+-- * Jornada mensual usada para cálculo de hora: 45 horas/semana -> 195 horas/mes (45 * 52 / 12 ≈ 195)
+-- * Horas extra: 1.5x entre semana, 2.0x sábados
+-- * Seguro Social (empleado): 9.75%  Seguro Social (patr): 13.25%
+-- * Seguro Educativo (empleado): 1.25%  Seguro Educativo (patr): 1.50%
+-- * Riesgo Profesional (patr): 0.56% (aporte patronal, no deducible del trabajador)
+-- * Bonificación por quincena aplicable a todos: B/.120
+-- * ISR: calculado anualizando la base mensual (incluye salario base, dietas y bonificaciones y comisión estimada a partir de la quincena)
+--   Método de cálculo del ISR (simplificado, conforme al ejemplo de la teoría):
+--   monthly_taxable = monthly_salary + monthly_dieta + (bonificacion*2) + commission_month_equiv
+--   annual_taxable = monthly_taxable * 12
+--   annual ISR:
+--     if <=11000 -> 0
+--     if >11000 and <=50000 -> (annual_taxable - 11000) * 0.15
+--     if >50000 -> 5850 + (annual_taxable - 50000) * 0.25
+--   ISR retenido en la quincena = (annual_isr / 12) / 2
+
+CREATE DATABASE IF NOT EXISTS prospersa_payroll CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+USE prospersa_payroll;
+
+-- Employees
+DROP TABLE IF EXISTS employees;
+CREATE TABLE employees (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(200) NOT NULL,
+  cedula VARCHAR(50),
+  marital_status VARCHAR(50),
+  position VARCHAR(100),
+  monthly_salary DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  monthly_dieta DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  monthly_discount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  commission_rate DECIMAL(10,6) NOT NULL DEFAULT 0.0000
+) ENGINE=InnoDB;
+
+-- Payroll periods
+DROP TABLE IF EXISTS payroll_periods;
+CREATE TABLE payroll_periods (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  start_date DATE,
+  end_date DATE,
+  description VARCHAR(200)
+) ENGINE=InnoDB;
+
+-- Extra hours entries (one row per extra worked)
+DROP TABLE IF EXISTS extra_hours;
+CREATE TABLE extra_hours (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id INT NOT NULL,
+  work_date DATE NOT NULL,
+  hours DECIMAL(6,2) NOT NULL,
+  is_saturday TINYINT(1) NOT NULL DEFAULT 0,
+  period_id INT,
+  FOREIGN KEY (employee_id) REFERENCES employees(id)
+) ENGINE=InnoDB;
+
+-- Sales (for commission)
+DROP TABLE IF EXISTS sales;
+CREATE TABLE sales (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id INT NOT NULL,
+  period_id INT,
+  total_sales DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+  FOREIGN KEY (employee_id) REFERENCES employees(id)
+) ENGINE=InnoDB;
+
+-- Seed employees (data from the user)
+TRUNCATE TABLE employees;
+INSERT INTO employees (name, cedula, marital_status, position, monthly_salary, monthly_dieta, monthly_discount, commission_rate) VALUES
+('Manuel Pe\u00f1a', '4-590-678', 'Casado', 'Reparador de calle', 690.00, 600.00, 250.00, 0.0000),
+('Jos\u00e9 Mart\u00ednez', '5-789-352', 'Soltero', 'Aseador', 696.15, 0.00, 50.00, 0.0000),
+('Federico Montiel', '4-590-678', 'Casado', 'Asistente de gerencia', 900.00, 0.00, 200.00, 0.0000),
+('Estefan\u00eda Sousa Rinc\u00f3n', '8-709-4552', 'Soltero', 'Vendedor Supervisor', 800.00, 0.00, 50.00, 0.0150);
+
+-- Seed payroll period: segunda quincena de junio 2026 (assume 2026-06-16 to 2026-06-30)
+TRUNCATE TABLE payroll_periods;
+INSERT INTO payroll_periods (start_date, end_date, description) VALUES
+('2026-06-16','2026-06-30','Segunda quincena de junio 2026');
+
+-- Get period id for reference
+SET @period_id := (SELECT id FROM payroll_periods WHERE start_date='2026-06-16' AND end_date='2026-06-30' LIMIT 1);
+
+-- Seed extra hours as described in the case
+TRUNCATE TABLE extra_hours;
+-- Jos\u00e9: 3 horas el lunes 22 y 2 horas el d\u00eda 25 (total 5h)
+INSERT INTO extra_hours (employee_id, work_date, hours, is_saturday, period_id)
+VALUES
+((SELECT id FROM employees WHERE name LIKE 'Jos%Mart%'), '2026-06-22', 3.00, 0, @period_id),
+((SELECT id FROM employees WHERE name LIKE 'Jos%Mart%'), '2026-06-25', 2.00, 0, @period_id);
+
+-- Federico: 3 horas s\u00e1bado 20 y 27 (ambos s\u00e1bados), y el mi\u00e9rcoles 24: 2 horas
+INSERT INTO extra_hours (employee_id, work_date, hours, is_saturday, period_id)
+VALUES
+((SELECT id FROM employees WHERE name LIKE 'Federico%'), '2026-06-20', 3.00, 1, @period_id),
+((SELECT id FROM employees WHERE name LIKE 'Federico%'), '2026-06-27', 3.00, 1, @period_id),
+((SELECT id FROM employees WHERE name LIKE 'Federico%'), '2026-06-24', 2.00, 0, @period_id);
+
+-- Manuel and Estefania: no extra hours indicated => none inserted
+
+-- Seed sales for Estefania for the period (55,000 in the quincena)
+TRUNCATE TABLE sales;
+INSERT INTO sales (employee_id, period_id, total_sales)
+VALUES
+((SELECT id FROM employees WHERE name LIKE 'Estefan%'), @period_id, 55000.00);
+
+-- -----------------------------------------------------------
+-- Payroll calculation query for the period (one-row per employee)
+-- -----------------------------------------------------------
+
+-- Constants used in calculations
+SET @jornada_mensual_hours := 195.0; -- horas/mes para la jornada de 45 semanales
+SET @horas_extra_factor_weekday := 1.5;
+SET @horas_extra_factor_saturday := 2.0;
+SET @ss_employee := 0.0975; -- 9.75%
+SET @ss_employer := 0.1325; -- 13.25%
+SET @edu_employee := 0.0125; -- 1.25%
+SET @edu_employer := 0.015;  -- 1.50%
+SET @risk_employer := 0.0056; -- 0.56%
+SET @bonificacion_quincena := 120.00;
+
+-- Final aggregated payroll result for the period
+SELECT
+  e.id AS employee_id,
+  e.name,
+  e.position,
+  e.cedula,
+  p.description AS period,
+  -- Components
+  ROUND(e.monthly_salary/2,2) AS base_quincena,
+  ROUND(e.monthly_dieta/2,2) AS dieta_quincena,
+  ROUND(@bonificacion_quincena,2) AS bonificacion_quincena,
+  -- Commission for the period (direct from sales * commission_rate)
+  ROUND(IFNULL(s.total_sales * e.commission_rate, 0.00),2) AS commission_quincena,
+  -- Hourly rate (approx.)
+  ROUND(e.monthly_salary / @jornada_mensual_hours,4) AS hora_valor,
+  -- Overtime pay (apply 1.5x weekday, 2.0x saturday)
+  ROUND(
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)
+  ,2) AS overtime_pay,
+  -- Gross
+  ROUND(
+    (e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)
+  ,2) AS salario_bruto_quincena,
+  -- Deducciones obligatorias (partes del trabajador)
+  ROUND(((
+    (e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)
+  ) * @ss_employee),2) AS descuento_seguro_social_empleado,
+  ROUND((
+    ((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)) * @edu_employee
+  ),2) AS descuento_seguro_educativo_empleado,
+  -- ISR: simplified annualization method
+  -- monthly_taxable = monthly_salary + monthly_dieta + (bonif*2) + (commission_quincena * 2)
+  ROUND(
+    (CASE
+      WHEN (
+        ( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12
+      ) <= 11000 THEN 0.00
+      WHEN (
+        ( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12
+      ) <= 50000 THEN (
+          (( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12) - 11000
+        ) * 0.15
+      ELSE 5850 + ( (( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12) - 50000 ) * 0.25
+    END) / 12 / 2
+  ,2) AS descuento_isr_quincena,
+  -- Other employee discounts (prorrateo mensual -> quincena)
+  ROUND(e.monthly_discount / 2,2) AS descuento_conceptos_empresa_quincena,
+  -- Total descuentos (empleado)
+  ROUND(
+    (((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)) * @ss_employee)
+    + (((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)) * @edu_employee)
+    + ( (CASE
+      WHEN (
+        ( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12
+      ) <= 11000 THEN 0.00
+      WHEN (
+        ( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12
+      ) <= 50000 THEN (
+          (( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12) - 11000
+        ) * 0.15
+      ELSE 5850 + ( (( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12) - 50000 ) * 0.25
+    END) / 12 / 2)
+    + (e.monthly_discount / 2)
+  ,2) AS total_descuentos_empleado_quincena,
+  -- Neto a pagar
+  ROUND(
+    ((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00))
+    - (
+      (((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+      COALESCE((SELECT SUM(
+        CASE WHEN ex.is_saturday = 1
+          THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+          ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+        END)
+      FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)) * @ss_employee)
+      + (((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+      COALESCE((SELECT SUM(
+        CASE WHEN ex.is_saturday = 1
+          THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+          ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+        END)
+      FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)) * @edu_employee)
+      + ( (CASE
+        WHEN (
+          ( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12
+        ) <= 11000 THEN 0.00
+        WHEN (
+          ( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12
+        ) <= 50000 THEN (
+            (( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12) - 11000
+          ) * 0.15
+        ELSE 5850 + ( (( (e.monthly_salary) + (e.monthly_dieta) + (@bonificacion_quincena * 2) + (IFNULL(s.total_sales * e.commission_rate,0) * 2) ) * 12) - 50000 ) * 0.25
+      END) / 12 / 2)
+      + (e.monthly_discount / 2)
+    )
+  ,2) AS neto_a_pagar_quincena,
+  -- Aportes patronales (se calculan sobre la misma base de devengos)
+  ROUND((
+    ((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)) * @ss_employer
+  ),2) AS aporte_patronal_seguro_social,
+  ROUND((
+    ((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)) * @edu_employer
+  ),2) AS aporte_patronal_seguro_educativo,
+  ROUND((
+    ((e.monthly_salary/2) + (e.monthly_dieta/2) + @bonificacion_quincena + IFNULL(s.total_sales * e.commission_rate,0) +
+    COALESCE((SELECT SUM(
+      CASE WHEN ex.is_saturday = 1
+        THEN ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_saturday
+        ELSE ex.hours * (e.monthly_salary / @jornada_mensual_hours) * @horas_extra_factor_weekday
+      END)
+    FROM extra_hours ex WHERE ex.employee_id = e.id AND ex.period_id = @period_id),0.00)) * @risk_employer
+  ),2) AS aporte_patronal_riesgo_profesional
+FROM employees e
+LEFT JOIN payroll_periods p ON p.id = @period_id
+LEFT JOIN sales s ON s.employee_id = e.id AND s.period_id = @period_id
+ORDER BY e.id;
+
+-- End of file
