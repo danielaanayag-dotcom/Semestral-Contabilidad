@@ -1,6 +1,7 @@
-CREATE DATABASE IF NOT EXISTS planilla_prospera
-    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE planilla_prospera;
+--CREATE DATABASE IF NOT EXISTS planilla_prospera
+--    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+--USE planilla_prospera;
+USE railway
 
 CREATE TABLE IF NOT EXISTS colaboradores (
     id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
