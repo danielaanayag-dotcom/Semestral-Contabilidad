@@ -18,3 +18,4 @@ try {
     $conexion = null;
     error_log('No fue posible conectar con la base de datos: ' . $e->getMessage());
 }
+?>
