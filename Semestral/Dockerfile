@@ -8,6 +8,10 @@ RUN apt-get update \
         git \
         unzip \
         libzip-dev \
+        libpng-dev \
+        libjpeg62-turbo-dev \
+        libfreetype6-dev \
+        libonig-dev \
     && docker-php-ext-configure gd \
         --with-freetype \
         --with-jpeg \
@@ -16,6 +20,8 @@ RUN apt-get update \
         pdo \
         pdo_mysql \
         zip \
+        mbstring \
+        gd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN a2enmod rewrite
